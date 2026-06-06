@@ -117,6 +117,12 @@ Our best kernel reaches 34% of cuBLAS HGEMM. The gap comes from:
 
 These are the techniques used by CUTLASS and cuBLAS. Each could be a future kernel.
 
+## Related projects
+
+- **[inference-kernel-cookbook](https://github.com/waynehacking8/inference-kernel-cookbook)** — Flash Attention, KV Cache, Paged Attention: the inference techniques built on top of the matmul kernel you learned here.
+- **[trtllm-triton-serving](https://github.com/waynehacking8/trtllm-triton-serving)** — What happens when you put these kernels into a production serving stack: TensorRT-LLM vs vLLM head-to-head on H100.
+- **[nccl-collectives-bench](https://github.com/waynehacking8/nccl-collectives-bench)** — The multi-GPU communication layer underneath: NCCL benchmarks on 8×H100 NVSwitch.
+
 ## Acknowledgments
 
 Inspired by [Andrej Karpathy](https://github.com/karpathy)'s "from scratch" philosophy (micrograd, nanoGPT, llm.c) and [Simon Boehm](https://siboehm.com/articles/22/CUDA-MMM)'s CUDA matmul optimization guide. This project starts where Boehm's ends — at tensor cores.
