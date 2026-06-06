@@ -124,9 +124,19 @@ These are the techniques used by CUTLASS and cuBLAS. Each could be a future kern
 - **[trtllm-triton-serving](https://github.com/waynehacking8/trtllm-triton-serving)** — What happens when you put these kernels into a production serving stack: TensorRT-LLM vs vLLM head-to-head on H100.
 - **[nccl-collectives-bench](https://github.com/waynehacking8/nccl-collectives-bench)** — The multi-GPU communication layer underneath: NCCL benchmarks on 8×H100 NVSwitch.
 
+## How this compares to other projects
+
+| Project | What it is | Performance | Our difference |
+|---------|-----------|-------------|---------------|
+| [siboehm SGEMM](https://siboehm.com/articles/22/CUDA-MMM) | CUDA-core matmul tutorial | ~80% cuBLAS SGEMM | We go beyond CUDA cores into tensor cores |
+| [LeetCUDA/HGEMM](https://github.com/xlite-dev/HGEMM) | HGEMM kernel collection (WMMA/MMA/CuTe) | 98-100% cuBLAS | We include the full CUDA-core→tensor-core progression; they start at tensor cores. They target RTX 4090/L20; we target Blackwell sm_120 |
+| [cuda_hgemm](https://github.com/Bruce-Lee-LY/cuda_hgemm) | HGEMM optimization methods | High | Same distinction: collection vs progressive tutorial |
+
+We reach 83% of cuBLAS HGEMM — not 98%. The remaining gap is real and comes from techniques like shared memory swizzling, warp specialization, and CuTe layouts. We prioritize readability and progressive learning over squeezing the last 15%.
+
 ## Acknowledgments
 
-Inspired by [Andrej Karpathy](https://github.com/karpathy)'s "from scratch" philosophy (micrograd, nanoGPT, llm.c) and [Simon Boehm](https://siboehm.com/articles/22/CUDA-MMM)'s CUDA matmul optimization guide. This project starts where Boehm's ends — at tensor cores.
+Inspired by [Andrej Karpathy](https://github.com/karpathy)'s "from scratch" philosophy (micrograd, nanoGPT, llm.c), [Simon Boehm](https://siboehm.com/articles/22/CUDA-MMM)'s CUDA matmul guide, and [LeetCUDA](https://github.com/xlite-dev/LeetCUDA)'s tensor core kernel library.
 
 ## License
 
