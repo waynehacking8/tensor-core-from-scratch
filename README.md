@@ -109,14 +109,15 @@ Start with `01_naive.cu` and read sequentially. Each step introduces one concept
 
 ## Where the remaining 17% is hiding
 
-Our best kernel reaches 83% of cuBLAS HGEMM. The gap comes from:
-- **Warp specialization**: separate warps for data movement vs compute
-- **Memory swizzling**: conflict-free shared memory access patterns
-- **Larger warp tiles**: each warp computing 64x64 or larger output tiles
-- **Software pipelining**: multi-stage async pipelines with barrier synchronization
-- **Tuned occupancy**: careful register/SMEM tradeoff per SM
+Our best kernel reaches 83% of cuBLAS HGEMM. A 109-agent deep research identified what's needed to close the gap:
 
-These are the techniques used by CUTLASS and cuBLAS. Each could be a future kernel.
+- **Shared memory swizzling**: XOR-based address remapping (`Swizzle(3,0,3)`: `idx ^ ((idx >> S) & mask)`) eliminates bank conflicts during fragment loads. Our +8 padding helps but doesn't fully solve it. Requires switching from WMMA to raw `mma.sync` + `ldmatrix` for swizzle-aware loading.
+- **Warp specialization**: separate producer warps (data movement) from consumer warps (compute), with asymmetric register allocation (40 regs vs 256 via `setmaxnreg`).
+- **mbarrier synchronization**: replace `__syncthreads()` with fine-grained producer-consumer handshaking.
+
+**Critical finding**: sm_120 (consumer Blackwell) uses `mma.sync` (Ampere-era), NOT `tcgen05`/UMMA (datacenter sm_100 only). No TMEM, no 2SM cooperative mode. Our optimization path follows Ampere/Hopper-class techniques, not datacenter Blackwell.
+
+Sources: [CUTLASS pipeline docs](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/pipeline.html), [Colfax GEMM tutorial](https://research.colfax-intl.com/cutlass-tutorial-design-of-a-gemm-kernel/), [CuTe swizzle paper](https://arxiv.org/abs/2603.02298).
 
 ## Related projects
 
