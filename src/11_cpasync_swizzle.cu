@@ -52,12 +52,12 @@ const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
 
-const int BM = 128;
-const int BN = 128;
-const int BK = 32;
-const int STAGES = 3;
+const int BM = 192;
+const int BN = 256;
+const int BK = 48;
+const int STAGES = 2;
 
-const int WARPS_M = 4;
+const int WARPS_M = 2;
 const int WARPS_N = 4;
 const int NUM_WARPS = WARPS_M * WARPS_N;
 const int BLOCK_SIZE = NUM_WARPS * 32;
