@@ -1,24 +1,29 @@
-// Kernel 11: 3-Stage Pipeline + Larger Warp Tiles
+// Kernel 11: cp.async 3-Stage Pipeline
 //
-// Kernels 09-10 use double buffering (2 stages). Here we add a third
-// stage so the GPU can have TWO prefetches in flight while computing
-// on a third — better hiding of memory latency for high-bandwidth
-// workloads.
+// This kernel uses cp.async (asynchronous global→shared memory copy)
+// with a 3-stage shared memory pipeline.  cp.async bypasses registers:
+// data goes directly from L2/DRAM to shared memory via a dedicated
+// hardware path, freeing registers for computation.
 //
-// We also increase the per-warp work: each warp computes 4 WMMA tiles
-// (2×2 arrangement) per K-iteration, and we unroll the K-loop within
-// each BK tile (BK=32 = 2 × WMMA_K=16).
+// The 3-stage pipeline works like a ring buffer:
+//   - PREFILL: issue async copies for stages 0, 1, 2
+//   - MAIN LOOP (each iteration):
+//     1. __pipeline_wait_prior(2) — wait for the oldest stage
+//     2. __syncthreads() — all threads see the data
+//     3. COMPUTE on the current stage
+//     4. __syncthreads() — compute done, stage is free
+//     5. PREFETCH next tile into the freed stage via cp.async
+//     6. __pipeline_commit() — ALWAYS commit (advances pipeline counter)
+//     7. Advance stage = (stage + 1) % 3
 //
-// The combination of 3-stage pipeline + larger warp tiles + BK=32
-// pushes compute utilization higher by ensuring warps always have
-// data ready to process.
-//
+// Reference: NVIDIA CUDA Programming Guide §4.11 (Asynchronous Data Copies)
 // Simplification: C = alpha * A * B (beta=0 only).
 
 #include <cstdio>
 #include <cstdlib>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -47,33 +52,69 @@ const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
 
-const int BM = 256;
+const int BM = 128;
 const int BN = 128;
 const int BK = 32;
 const int STAGES = 3;
 
-const int WARPS_M = 8;
+const int WARPS_M = 4;
 const int WARPS_N = 4;
-const int NUM_WARPS = WARPS_M * WARPS_N; // 32
-const int BLOCK_SIZE = NUM_WARPS * 32;   // 1024
+const int NUM_WARPS = WARPS_M * WARPS_N;
+const int BLOCK_SIZE = NUM_WARPS * 32;
 
 const int WARP_TILES_M = BM / (WARPS_M * WMMA_M); // 2
 const int WARP_TILES_N = BN / (WARPS_N * WMMA_N); // 2
 
-__global__ void hgemm_3stage(int M, int N, int K, float alpha,
-                              const half *A, const half *B, float *C) {
-  const int A_STRIDE = BK + 8;
-  const int B_STRIDE = BN + 8;
+const int A_SMEM_STRIDE = BK + 8;
+const int B_SMEM_STRIDE = BN + 8;
+const int STAGE_A_SIZE = BM * A_SMEM_STRIDE;
+const int STAGE_B_SIZE = BK * B_SMEM_STRIDE;
+const int STAGE_SIZE = STAGE_A_SIZE + STAGE_B_SIZE;
 
+__device__ __forceinline__ void async_copy_16B(void *dst, const void *src,
+                                                bool valid) {
+  uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  int src_bytes = valid ? 16 : 0;
+  asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n"
+               ::"r"(dst_addr), "l"(src), "n"(16), "r"(src_bytes));
+}
+
+__device__ void load_stage_async(half *smem, int stage, const half *A,
+                                  const half *B, int M, int N, int K, int bk,
+                                  int blockRowStart, int blockColStart) {
+  half *As = smem + stage * STAGE_SIZE;
+  half *Bs = smem + stage * STAGE_SIZE + STAGE_A_SIZE;
+
+  // Load A[BM][BK]: 128 rows × 32 cols = 4096 halfs, each thread copies 8 halfs
+  for (int i = threadIdx.x; i < BM * (BK / 8); i += blockDim.x) {
+    int row = i / (BK / 8);
+    int col8 = (i % (BK / 8)) * 8;
+    int gRow = blockRowStart + row;
+    int gCol = bk + col8;
+    bool valid = (gRow < M) && (gCol + 7 < K);
+    async_copy_16B(As + row * A_SMEM_STRIDE + col8,
+                   A + gRow * K + gCol, valid);
+  }
+
+  // Load B[BK][BN]: 32 rows × 128 cols = 4096 halfs
+  for (int i = threadIdx.x; i < BK * (BN / 8); i += blockDim.x) {
+    int row = i / (BN / 8);
+    int col8 = (i % (BN / 8)) * 8;
+    int gRow = bk + row;
+    int gCol = blockColStart + col8;
+    bool valid = (gRow < K) && (gCol + 7 < N);
+    async_copy_16B(Bs + row * B_SMEM_STRIDE + col8,
+                   B + gRow * N + gCol, valid);
+  }
+}
+
+__global__ void hgemm_cpasync(int M, int N, int K, float alpha,
+                               const half *A, const half *B, float *C) {
   extern __shared__ half smem[];
-  const int stage_a = BM * A_STRIDE;
-  const int stage_b = BK * B_STRIDE;
-  const int stage_total = stage_a + stage_b;
 
   const int warpId = threadIdx.x / 32;
   const int warpRow = warpId / WARPS_N;
   const int warpCol = warpId % WARPS_N;
-
   const int blockRowStart = blockIdx.y * BM;
   const int blockColStart = blockIdx.x * BN;
 
@@ -83,40 +124,30 @@ __global__ void hgemm_3stage(int M, int N, int K, float alpha,
     for (int tn = 0; tn < WARP_TILES_N; tn++)
       wmma::fill_fragment(acc[tm][tn], 0.0f);
 
-  auto load_stage = [&](int stage, int bk) {
-    half *As = smem + stage * stage_total;
-    half *Bs = smem + stage * stage_total + stage_a;
-
-    for (int i = threadIdx.x; i < BM * BK; i += BLOCK_SIZE) {
-      int r = i / BK, c = i % BK;
-      int gr = blockRowStart + r, gc = bk + c;
-      As[r * A_STRIDE + c] =
-          (gr < M && gc < K) ? A[gr * K + gc] : __float2half(0.0f);
-    }
-    for (int i = threadIdx.x; i < BK * BN; i += BLOCK_SIZE) {
-      int r = i / BN, c = i % BN;
-      int gr = bk + r, gc = blockColStart + c;
-      Bs[r * B_STRIDE + c] =
-          (gr < K && gc < N) ? B[gr * N + gc] : __float2half(0.0f);
-    }
-  };
-
   int numKTiles = (K + BK - 1) / BK;
 
-  // Prefill: load first min(STAGES, numKTiles) stages
-  int filled = 0;
+  // === PREFILL: issue async copies for first STAGES tiles ===
   for (int s = 0; s < STAGES && s < numKTiles; s++) {
-    load_stage(s, s * BK);
-    filled++;
+    load_stage_async(smem, s, A, B, M, N, K, s * BK,
+                     blockRowStart, blockColStart);
+    __pipeline_commit();
   }
-  __syncthreads();
 
+  // === MAIN LOOP ===
+  int stage = 0;
   for (int tile = 0; tile < numKTiles; tile++) {
-    int cur = tile % STAGES;
+    // Step 1: Wait for the current stage's async copies to complete.
+    // wait_prior(STAGES-1) means: wait until at most (STAGES-1)
+    // committed batches remain in flight. Since we have STAGES total,
+    // the oldest one (our current stage) must be done.
+    __pipeline_wait_prior(STAGES - 1);
 
-    // Compute on current stage FIRST (data is ready from prefill or prior prefetch)
-    half *As_cur = smem + cur * stage_total;
-    half *Bs_cur = smem + cur * stage_total + stage_a;
+    // Step 2: All threads must see the completed data
+    __syncthreads();
+
+    // Step 3: COMPUTE on the current stage
+    half *As_cur = smem + stage * STAGE_SIZE;
+    half *Bs_cur = smem + stage * STAGE_SIZE + STAGE_A_SIZE;
 
     for (int kk = 0; kk < BK; kk += WMMA_K) {
       for (int tm = 0; tm < WARP_TILES_M; tm++) {
@@ -129,24 +160,33 @@ __global__ void hgemm_3stage(int M, int N, int K, float alpha,
           wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half,
                          wmma::row_major> b_frag;
 
-          wmma::load_matrix_sync(a_frag, As_cur + aRow * A_STRIDE + kk, A_STRIDE);
-          wmma::load_matrix_sync(b_frag, Bs_cur + kk * B_STRIDE + bCol, B_STRIDE);
+          wmma::load_matrix_sync(a_frag, As_cur + aRow * A_SMEM_STRIDE + kk,
+                                 A_SMEM_STRIDE);
+          wmma::load_matrix_sync(b_frag, Bs_cur + kk * B_SMEM_STRIDE + bCol,
+                                 B_SMEM_STRIDE);
           wmma::mma_sync(acc[tm][tn], a_frag, b_frag, acc[tm][tn]);
         }
       }
     }
 
+    // Step 4: Compute done — this stage's smem is now free
     __syncthreads();
 
-    // THEN prefetch into the stage we just consumed (safe — compute is done)
-    int prefetchTile = tile + STAGES;
-    if (prefetchTile < numKTiles) {
-      load_stage(cur, prefetchTile * BK);
+    // Step 5: PREFETCH next tile into the freed stage
+    int prefetch_tile = tile + STAGES;
+    if (prefetch_tile < numKTiles) {
+      load_stage_async(smem, stage, A, B, M, N, K, prefetch_tile * BK,
+                       blockRowStart, blockColStart);
     }
 
-    __syncthreads();
+    // Step 6: ALWAYS commit to advance the pipeline counter
+    __pipeline_commit();
+
+    // Step 7: Advance to next stage
+    stage = (stage + 1) % STAGES;
   }
 
+  // Store results
   for (int tm = 0; tm < WARP_TILES_M; tm++) {
     for (int tn = 0; tn < WARP_TILES_N; tn++) {
       int cRow = blockRowStart + (warpRow * WARP_TILES_M + tm) * WMMA_M;
@@ -172,180 +212,107 @@ void randomize(float *h, int n) {
 }
 
 float benchmark_cublas_sgemm(int M, int N, int K, const float *dA,
-                              const float *dB, float *dC, int warmup,
-                              int iters) {
-  cublasHandle_t handle;
-  CUBLAS_CHECK(cublasCreate(&handle));
-  float alpha = 1.0f, beta = 0.0f;
-  for (int i = 0; i < warmup; ++i)
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-                             dB, N, dA, K, &beta, dC, N));
+                              const float *dB, float *dC, int w, int it) {
+  cublasHandle_t handle; CUBLAS_CHECK(cublasCreate(&handle));
+  float alpha=1,beta=0;
+  for(int i=0;i<w;i++) CUBLAS_CHECK(cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,&alpha,dB,N,dA,K,&beta,dC,N));
   CUDA_CHECK(cudaDeviceSynchronize());
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-  CUDA_CHECK(cudaEventRecord(start));
-  for (int i = 0; i < iters; ++i)
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-                             dB, N, dA, K, &beta, dC, N));
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  float ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-  CUBLAS_CHECK(cublasDestroy(handle));
-  return ms / iters;
+  cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+  cudaEventRecord(t0);
+  for(int i=0;i<it;i++) CUBLAS_CHECK(cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,&alpha,dB,N,dA,K,&beta,dC,N));
+  cudaEventRecord(t1); cudaEventSynchronize(t1);
+  float ms; cudaEventElapsedTime(&ms,t0,t1);
+  cudaEventDestroy(t0); cudaEventDestroy(t1);
+  CUBLAS_CHECK(cublasDestroy(handle)); return ms/it;
 }
 
 float benchmark_cublas_hgemm(int M, int N, int K, const half *dA,
-                              const half *dB, half *dC, int warmup,
-                              int iters) {
-  cublasHandle_t handle;
-  CUBLAS_CHECK(cublasCreate(&handle));
-  half alpha = __float2half(1.0f), beta = __float2half(0.0f);
-  for (int i = 0; i < warmup; ++i)
-    CUBLAS_CHECK(cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-                             dB, N, dA, K, &beta, dC, N));
+                              const half *dB, half *dC, int w, int it) {
+  cublasHandle_t handle; CUBLAS_CHECK(cublasCreate(&handle));
+  half alpha=__float2half(1),beta=__float2half(0);
+  for(int i=0;i<w;i++) CUBLAS_CHECK(cublasHgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,&alpha,dB,N,dA,K,&beta,dC,N));
   CUDA_CHECK(cudaDeviceSynchronize());
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-  CUDA_CHECK(cudaEventRecord(start));
-  for (int i = 0; i < iters; ++i)
-    CUBLAS_CHECK(cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-                             dB, N, dA, K, &beta, dC, N));
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  float ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-  CUBLAS_CHECK(cublasDestroy(handle));
-  return ms / iters;
+  cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+  cudaEventRecord(t0);
+  for(int i=0;i<it;i++) CUBLAS_CHECK(cublasHgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,&alpha,dB,N,dA,K,&beta,dC,N));
+  cudaEventRecord(t1); cudaEventSynchronize(t1);
+  float ms; cudaEventElapsedTime(&ms,t0,t1);
+  cudaEventDestroy(t0); cudaEventDestroy(t1);
+  CUBLAS_CHECK(cublasDestroy(handle)); return ms/it;
 }
 
 void verify(const float *ref, const float *test, int n, const char *label) {
-  float max_err = 0.0f;
-  double sum_err = 0.0;
-  for (int i = 0; i < n; ++i) {
-    float diff = fabsf(ref[i] - test[i]);
-    sum_err += diff;
-    if (diff > max_err) max_err = diff;
-  }
-  float avg_err = (float)(sum_err / n);
-  printf("  %-35s max=%.4f avg=%.6f %s\n", label, max_err, avg_err,
-         max_err < 5.0f ? "[PASS]" : "[FAIL]");
+  float mx=0; double sum=0;
+  for(int i=0;i<n;i++){float d=fabsf(ref[i]-test[i]);sum+=d;if(d>mx)mx=d;}
+  printf("  %-35s max=%.4f avg=%.6f %s\n",label,mx,(float)(sum/n),mx<5.0f?"[PASS]":"[FAIL]");
 }
 
 int main() {
-  printf("=== Kernel 11: 3-Stage Pipeline + BM=256 ===\n\n");
+  printf("=== Kernel 11: cp.async 3-Stage Pipeline ===\n\n");
+  cudaDeviceProp prop; CUDA_CHECK(cudaGetDeviceProperties(&prop,0));
+  printf("GPU: %s (SM %d.%d)\n",prop.name,prop.major,prop.minor);
 
-  cudaDeviceProp prop;
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-  printf("GPU: %s (SM %d.%d)\n", prop.name, prop.major, prop.minor);
-  printf("Max SMEM (optin): %zu bytes\n", prop.sharedMemPerBlockOptin);
+  size_t smem = STAGES * STAGE_SIZE * sizeof(half);
+  printf("SMEM: %zu bytes (max %zu)\n\n", smem, prop.sharedMemPerBlockOptin);
+  if(smem>prop.sharedMemPerBlockOptin){printf("TOO LARGE\n");return 1;}
 
-  size_t smem_needed = STAGES * (BM * (BK + 8) + BK * (BN + 8)) * sizeof(half);
-  printf("3-stage SMEM: %zu bytes %s\n\n", smem_needed,
-         smem_needed <= prop.sharedMemPerBlockOptin ? "(OK)" : "(TOO LARGE)");
+  const int M=4096,N=4096,K=4096; const float alpha=1;
+  const int warmup=5,iters=20;
+  printf("Problem: %dx%dx%d, BM=%d BN=%d BK=%d Stages=%d\n",M,N,K,BM,BN,BK,STAGES);
+  printf("Warps: %d, Threads: %d, Warp tiles: %dx%d\n\n",NUM_WARPS,BLOCK_SIZE,WARP_TILES_M,WARP_TILES_N);
 
-  if (smem_needed > prop.sharedMemPerBlockOptin) {
-    printf("Need %zu but have %zu — reduce BM or STAGES\n",
-           smem_needed, prop.sharedMemPerBlockOptin);
-    return 1;
-  }
+  size_t bA=(size_t)M*K*sizeof(float),bB=(size_t)K*N*sizeof(float),bC=(size_t)M*N*sizeof(float);
+  float *hA=(float*)malloc(bA),*hB=(float*)malloc(bB),*hCr=(float*)malloc(bC),*hCt=(float*)malloc(bC);
+  srand(42); randomize(hA,M*K); randomize(hB,K*N);
 
-  const int M = 4096, N = 4096, K = 4096;
-  const float alpha = 1.0f;
-  const int warmup = 5, iters = 20;
+  float *dAf,*dBf,*dC; half *dAh,*dBh,*dCh;
+  CUDA_CHECK(cudaMalloc(&dAf,bA)); CUDA_CHECK(cudaMalloc(&dBf,bB));
+  CUDA_CHECK(cudaMalloc(&dC,bC));
+  CUDA_CHECK(cudaMalloc(&dAh,(size_t)M*K*2)); CUDA_CHECK(cudaMalloc(&dBh,(size_t)K*N*2));
+  CUDA_CHECK(cudaMalloc(&dCh,(size_t)M*N*2));
+  CUDA_CHECK(cudaMemcpy(dAf,hA,bA,cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dBf,hB,bB,cudaMemcpyHostToDevice));
 
-  printf("Problem: M=%d, N=%d, K=%d\n", M, N, K);
-  printf("FLOPs: %.2f GFLOP\n", 2.0 * M * N * K * 1e-9);
-  printf("Block: BM=%d, BN=%d, BK=%d, Stages=%d\n", BM, BN, BK, STAGES);
-  printf("Warps: %d (%dx%d), Threads: %d\n", NUM_WARPS, WARPS_M, WARPS_N,
-         BLOCK_SIZE);
-  printf("Warp tiles: %dx%d\n\n", WARP_TILES_M, WARP_TILES_N);
-
-  size_t bytes_A = (size_t)M * K * sizeof(float);
-  size_t bytes_B = (size_t)K * N * sizeof(float);
-  size_t bytes_C = (size_t)M * N * sizeof(float);
-
-  float *hA = (float *)malloc(bytes_A);
-  float *hB = (float *)malloc(bytes_B);
-  float *hC_ref = (float *)malloc(bytes_C);
-  float *hC_test = (float *)malloc(bytes_C);
-
-  srand(42);
-  randomize(hA, M * K);
-  randomize(hB, K * N);
-
-  float *dA_f32, *dB_f32, *dC;
-  half *dA_f16, *dB_f16, *dC_f16;
-  CUDA_CHECK(cudaMalloc(&dA_f32, bytes_A));
-  CUDA_CHECK(cudaMalloc(&dB_f32, bytes_B));
-  CUDA_CHECK(cudaMalloc(&dC, bytes_C));
-  CUDA_CHECK(cudaMalloc(&dA_f16, (size_t)M * K * sizeof(half)));
-  CUDA_CHECK(cudaMalloc(&dB_f16, (size_t)K * N * sizeof(half)));
-  CUDA_CHECK(cudaMalloc(&dC_f16, (size_t)M * N * sizeof(half)));
-
-  CUDA_CHECK(cudaMemcpy(dA_f32, hA, bytes_A, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB_f32, hB, bytes_B, cudaMemcpyHostToDevice));
-
-  int threads = 256;
-  fp32_to_fp16<<<(M * K + threads - 1) / threads, threads>>>(dA_f32, dA_f16, M * K);
-  fp32_to_fp16<<<(K * N + threads - 1) / threads, threads>>>(dB_f32, dB_f16, K * N);
+  int t=256;
+  fp32_to_fp16<<<(M*K+t-1)/t,t>>>(dAf,dAh,M*K);
+  fp32_to_fp16<<<(K*N+t-1)/t,t>>>(dBf,dBh,K*N);
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  float sgemm_ms = benchmark_cublas_sgemm(M, N, K, dA_f32, dB_f32, dC, warmup, iters);
-  CUDA_CHECK(cudaMemcpy(hC_ref, dC, bytes_C, cudaMemcpyDeviceToHost));
-  double sgemm_tflops = 2.0 * M * N * K / (sgemm_ms * 1e-3) * 1e-12;
+  float sms=benchmark_cublas_sgemm(M,N,K,dAf,dBf,dC,warmup,iters);
+  CUDA_CHECK(cudaMemcpy(hCr,dC,bC,cudaMemcpyDeviceToHost));
+  double st=2.0*M*N*K/(sms*1e-3)*1e-12;
 
-  float hgemm_ms = benchmark_cublas_hgemm(M, N, K, dA_f16, dB_f16, dC_f16, warmup, iters);
-  double hgemm_tflops = 2.0 * M * N * K / (hgemm_ms * 1e-3) * 1e-12;
+  float hms=benchmark_cublas_hgemm(M,N,K,dAh,dBh,dCh,warmup,iters);
+  double ht=2.0*M*N*K/(hms*1e-3)*1e-12;
 
-  CUDA_CHECK(cudaFuncSetAttribute(hgemm_3stage,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, smem_needed));
+  CUDA_CHECK(cudaFuncSetAttribute(hgemm_cpasync,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
+  dim3 grid((N+BN-1)/BN,(M+BM-1)/BM), block(BLOCK_SIZE);
 
-  dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-  dim3 block(BLOCK_SIZE);
-
-  for (int i = 0; i < warmup; ++i)
-    hgemm_3stage<<<grid, block, smem_needed>>>(M, N, K, alpha, dA_f16, dB_f16, dC);
+  for(int i=0;i<warmup;i++)
+    hgemm_cpasync<<<grid,block,smem>>>(M,N,K,alpha,dAh,dBh,dC);
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-  CUDA_CHECK(cudaEventRecord(start));
-  for (int i = 0; i < iters; ++i)
-    hgemm_3stage<<<grid, block, smem_needed>>>(M, N, K, alpha, dA_f16, dB_f16, dC);
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
+  cudaEvent_t ev_start, ev_stop;
+  cudaEventCreate(&ev_start); cudaEventCreate(&ev_stop);
+  cudaEventRecord(ev_start);
+  for(int i=0;i<iters;i++)
+    hgemm_cpasync<<<grid,block,smem>>>(M,N,K,alpha,dAh,dBh,dC);
+  cudaEventRecord(ev_stop); cudaEventSynchronize(ev_stop);
+  float kms; cudaEventElapsedTime(&kms,ev_start,ev_stop); kms/=iters;
 
-  float kernel_ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
-  kernel_ms /= iters;
+  CUDA_CHECK(cudaMemcpy(hCt,dC,bC,cudaMemcpyDeviceToHost));
+  double kt=2.0*M*N*K/(kms*1e-3)*1e-12;
 
-  CUDA_CHECK(cudaMemcpy(hC_test, dC, bytes_C, cudaMemcpyDeviceToHost));
-  double kernel_tflops = 2.0 * M * N * K / (kernel_ms * 1e-3) * 1e-12;
-
-  printf("%-24s %8.2f ms  %7.2f TFLOPS\n", "cuBLAS SGEMM (FP32):", sgemm_ms,
-         sgemm_tflops);
-  printf("%-24s %8.2f ms  %7.2f TFLOPS\n", "cuBLAS HGEMM (FP16):", hgemm_ms,
-         hgemm_tflops);
+  printf("%-24s %8.2f ms  %7.2f TFLOPS\n","cuBLAS SGEMM (FP32):",sms,st);
+  printf("%-24s %8.2f ms  %7.2f TFLOPS\n","cuBLAS HGEMM (FP16):",hms,ht);
   printf("%-24s %8.2f ms  %7.2f TFLOPS  (%5.1f%% SGEMM, %5.1f%% HGEMM)\n",
-         "11_3stage:", kernel_ms, kernel_tflops,
-         100.0 * kernel_tflops / sgemm_tflops,
-         100.0 * kernel_tflops / hgemm_tflops);
+         "11_cpasync:",kms,kt,100*kt/st,100*kt/ht);
   printf("\n");
+  verify(hCr,hCt,M*N,"11_cpasync vs cuBLAS FP32");
 
-  verify(hC_ref, hC_test, M * N, "11_3stage vs cuBLAS FP32");
-
-  free(hA); free(hB); free(hC_ref); free(hC_test);
-  CUDA_CHECK(cudaFree(dA_f32)); CUDA_CHECK(cudaFree(dB_f32));
-  CUDA_CHECK(cudaFree(dC)); CUDA_CHECK(cudaFree(dC_f16));
-  CUDA_CHECK(cudaFree(dA_f16)); CUDA_CHECK(cudaFree(dB_f16));
-  CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop));
+  free(hA);free(hB);free(hCr);free(hCt);
+  CUDA_CHECK(cudaFree(dAf));CUDA_CHECK(cudaFree(dBf));CUDA_CHECK(cudaFree(dC));
+  CUDA_CHECK(cudaFree(dCh));CUDA_CHECK(cudaFree(dAh));CUDA_CHECK(cudaFree(dBh));
+  cudaEventDestroy(ev_start); cudaEventDestroy(ev_stop);
   return 0;
 }

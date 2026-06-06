@@ -1,8 +1,8 @@
 # tensor-core-from-scratch
 
-**125 TFLOPS from hand-written CUDA. 42% of cuBLAS HGEMM. 11 self-contained files. No frameworks.**
+**186 TFLOPS from hand-written CUDA. 63% of cuBLAS HGEMM. 11 self-contained files. No frameworks.**
 
-A step-by-step progression from a naive matmul to optimized tensor cores on NVIDIA Blackwell, with every kernel benchmarked against cuBLAS and verified for correctness. ~3,000 lines of CUDA total. Read the code top-to-bottom — that's the whole point.
+A step-by-step progression from a naive matmul to cp.async tensor core pipelines on NVIDIA Blackwell, with every kernel benchmarked against cuBLAS and verified for correctness. ~3,000 lines of CUDA total. Read the code top-to-bottom — that's the whole point.
 
 ![Performance Progression](assets/performance.png)
 
@@ -28,10 +28,10 @@ Kernel                    TFLOPS   % HGEMM   What You Learn
 08 PTX mma.sync            45.29     15.3%    Raw PTX: full register control
 09 WMMA Double-Buffered    68.09     23.0%    Hide memory latency behind compute
 10 Large Tiles + Dbuf     100.47     34.0%    BK=32 + double-buffer + 2x2 warp tiles
-11 3-Stage Pipeline       124.70     42.1%    BM=256 + 3-stage + 1024 threads
+11 cp.async Pipeline      186.29     63.3%    cp.async + 3-stage pipeline + BK=32
 ---------------------------------------------------------------
-   cuBLAS SGEMM (FP32)    58.55     19.8%    (CUDA core reference)
-   cuBLAS HGEMM (FP16)   296.20    100.0%    (tensor core reference)
+   cuBLAS SGEMM (FP32)    58.55     19.9%    (CUDA core reference)
+   cuBLAS HGEMM (FP16)   294.06    100.0%    (tensor core reference)
 ```
 
 Kernel 06 is intentionally slower than 05. Kernel 10 beats cuBLAS SGEMM by 1.7x because tensor cores have higher FP16 throughput than CUDA cores have FP32 throughput. The real target is cuBLAS HGEMM — we reach 34% of it, with the remaining gap due to techniques like cp.async, warp specialization, and memory swizzling.
@@ -90,7 +90,7 @@ Requirements: CUDA Toolkit 12.8+ and an NVIDIA GPU with compute capability 7.0+ 
 | 08 | `08_mma_ptx.cu` | Drop to inline PTX assembly. `mma.sync.aligned.m16n8k8` with manual fragment loading. Full control over register layout. |
 | 09 | `09_wmma_double_buffered.cu` | Double-buffered shared memory: prefetch tile K+1 while computing on tile K. Hides global memory latency behind tensor core compute. |
 | 10 | `10_mma_async_pipeline.cu` | BK=32 (2x K-steps per load) + double-buffer + 2x2 WMMA tiles per warp = 100 TFLOPS. |
-| 11 | `11_cpasync_swizzle.cu` | 3-stage pipeline, BM=256, 1024 threads, 32 warps. Maximizes occupancy and memory latency hiding. 125 TFLOPS — the best in this project. |
+| 11 | `11_cpasync_swizzle.cu` | `cp.async` global→shared bypass + 3-stage pipeline. Data flows directly to shared memory without touching registers. 186 TFLOPS (63% of cuBLAS HGEMM) — the best in this project. |
 
 ## How to Read This Project
 
@@ -107,11 +107,9 @@ Start with `01_naive.cu` and read sequentially. Each step introduces one concept
 9. **09 -> 10**: Larger K-tiles -> more compute per memory load
 10. **10 -> 11**: More pipeline stages + bigger blocks -> higher occupancy
 
-## Where the remaining 58% is hiding
+## Where the remaining 37% is hiding
 
-Our best kernel reaches 42% of cuBLAS HGEMM. The gap comes from:
-
-- **cp.async**: true asynchronous global→shared copies that bypass registers
+Our best kernel reaches 63% of cuBLAS HGEMM. The gap comes from:
 - **Warp specialization**: separate warps for data movement vs compute
 - **Memory swizzling**: conflict-free shared memory access patterns
 - **Larger warp tiles**: each warp computing 64x64 or larger output tiles
